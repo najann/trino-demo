@@ -1,0 +1,550 @@
+#######################################
+# Create datalake namespace
+oc new-project datalake --display-name="Data Lake" --description="A set of multiple databases, forming an exemplary data lake."
+
+#######################################
+# PostgreSQL
+
+# Install postgres
+
+# (a) OpenShift
+# -> Use Operator
+
+# Install postgres client (psql)
+# See: https://www.postgresql.org/download/linux/redhat/
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-ppc64le/pgdg-redhat-repo-latest.noarch.rpm
+sudo dnf -qy module disable postgresql
+sudo dnf install -y postgresql10
+
+
+# Initialize stock-prices
+# See: https://www.nasdaq.com/market-activity/stocks/aapl/historical
+# (set scope to "MAX")
+
+POSTGRES_POD=$(oc get po -l name=postgresql -o jsonpath="{.items[0].metadata.name}")
+oc port-forward ${POSTGRES_POD} 5432:5432
+
+DATA_FILE=HistoricalData_Apple.csv
+wget https://ibm.box.com/shared/static/89i7cxkeok6ndd0kh6q2ycvviip94eby.csv -O $DATA_FILE
+sed -i 's/\$//g' $DATA_FILE
+cat > init-stock-prices.sql <<EOF
+CREATE TABLE IF NOT EXISTS public.applehistory
+(
+    "Date" date NOT NULL,
+    "Close" real,
+    "Volume" bigint,
+    "Open" real,
+    "High" real,
+    "Low" real,
+    CONSTRAINT "appleHistory_pkey" PRIMARY KEY ("Date")
+);
+
+\copy public.applehistory FROM '$DATA_FILE' WITH (FORMAT csv, HEADER true, DELIMITER ',');
+EOF
+psql -h 127.0.0.1 -p 5432 -U admin -d stock-prices -a -f init-stock-prices.sql
+
+
+#######################################
+# MongoDB
+
+cat > deploy-mongodb.yaml <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb
+  labels:
+    app: mongodb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: ibmcom/mongodb-ppc64le:latest
+        ports:
+        - containerPort: 27017
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          value: admin
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          value: admin
+        volumeMounts:
+        - mountPath: /data/db
+          name: mongodb-volume
+      volumes:
+      - name: mongodb-volume
+        persistentVolumeClaim:
+          claimName: mongodb-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongodb-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: mongodb
+  name: mongodb
+spec:
+  ports:
+  - port: 27017
+    protocol: TCP
+    targetPort: 27017
+  selector:
+    app: mongodb
+EOF
+
+oc apply -f deploy-mongodb.yaml
+
+
+# Fill MongoDB with data
+​
+MONGODB_POD=$(oc get po -l app=mongodb -o jsonpath="{.items[0].metadata.name}")
+oc port-forward ${MONGODB_POD} 27017:27017
+
+WEATHER_FILE=weather_ny_2012-2022.csv
+wget https://ibm.box.com/shared/static/3tgm9bwxsl8tjezk0jgfjvk48cma46li.csv -O $WEATHER_FILE
+
+# See: https://www.mongodb.com/try/download/shell?jmp=docs
+dnf install -y https://downloads.mongodb.com/compass/mongodb-mongosh-1.6.0.ppc64le.rpm
+
+# See: https://www.mongodb.com/try/download/database-tools?tck=docs_databasetools
+MONGODB_DATABASE_TOOLS=mongodb-database-tools-rhel81-ppc64le-100.6.0
+wget https://fastdl.mongodb.org/tools/db/${MONGODB_DATABASE_TOOLS}.tgz
+tar -xf ${MONGODB_DATABASE_TOOLS}.tgz
+mv ./${MONGODB_DATABASE_TOOLS}/bin/* /usr/bin/
+rm -f ${MONGODB_DATABASE_TOOLS}.tgz
+rm -rf ./${MONGODB_DATABASE_TOOLS}
+
+mongoimport -d weather -c weatherny --type csv --file $WEATHER_FILE --headerline --username admin --password admin --authenticationDatabase admin
+
+cat > mongo-schema-definition.json <<EOF
+{
+    "table": "weatherny",
+    "fields": [
+        {"name": "_id",
+         "type": "date",
+         "hidden": false },
+        {"name": "AWND",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "PGTM",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "PRCP",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "SNOW",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "SNWD",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "TAVG",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "TMAX",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "TMIN",
+         "type": "DOUBLE",
+         "hidden": false }
+    ]
+}
+EOF
+
+mongoimport -d weather -c schemadef --file mongo-schema-definition.json --username admin --password admin --authenticationDatabase admin
+
+cat > create-mongo-user.mongodb <<EOF
+db.createUser(
+  {
+    user: "appuser2",
+    pwd: "apppwd2",
+    roles: [ { role: "dbOwner", db: "weather" } ]
+  }
+)
+EOF
+mongosh -u admin -p admin --authenticationDatabase admin weather -f create-mongo-user.mongodb
+
+# Test
+# mongosh -u appuser2 -p apppwd2 weather
+# db.weatherny.count()
+
+
+#######################################
+# Kafka / RH AMQ Streams
+# AMQ operator: https://access.redhat.com/products/red-hat-amq
+# with tls/certs: https://developers.redhat.com/blog/2018/10/29/how-to-run-kafka-on-openshift-the-enterprise-kubernetes-with-amq-streams#test_using_an_external_application
+# with bridges: https://medium.com/swlh/getting-started-with-kafka-on-openshift-c44c0fdec384
+# http://www.masterspringboot.com/apache-kafka/accessing-apache-kafka-on-openshift-using-its-rest-api/ + https://strimzi.io/docs/bridge/latest/
+​
+# Install Kafka
+
+# (a) OpenShift
+# -> Use AMQ Streams Operator
+
+cat > kafka_cluster.yaml <<EOF
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+ name: stock-weather-streams
+spec:
+  kafka:
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      inter.broker.protocol.version: '3.1'
+    storage:
+      type: ephemeral
+    listeners:
+      - name: external
+        port: 9094
+        type: route
+        tls: false
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+    version: 3.1.0
+    replicas: 3
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+  zookeeper:
+    storage:
+      type: ephemeral
+    replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: stockdata
+  labels:
+    strimzi.io/cluster: stock-weather-streams
+spec:
+  partitions: 10
+  replicas: 3
+  config:
+    retention.ms: 604800000
+    segment.bytes: 1073741824
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: weatherdata
+  labels:
+    strimzi.io/cluster: stock-weather-streams
+spec:
+  partitions: 10
+  replicas: 3
+  config:
+    retention.ms: 604800000
+    segment.bytes: 1073741824
+---
+apiVersion: kafka.strimzi.io/v1alpha1
+kind: KafkaBridge
+metadata:
+  name: kafka-bridge
+  labels:
+    strimzi.io/cluster: stock-weather-streams
+spec:
+  replicas: 1
+  bootstrapServers: 'stock-weather-streams-kafka-bootstrap:9092'
+  http:
+    port: 8090
+EOF
+
+oc apply -f kafka_cluster.yaml
+
+wget https://ibm.box.com/shared/static/78r9s8o7bpd81o420valu5ucureef8v2.txt -O stockDataProducer.py
+wget https://ibm.box.com/shared/static/bj8qux7v3t8m3yokm490obtvaiop2ld9.txt -O weatherDataProducer.py
+
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" stockDataProducer.py
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" weatherDataProducer.py
+
+cat > weatherDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY weatherDataProducer.py .
+
+ENTRYPOINT python weatherDataProducer.py
+EOF
+
+cat > stockDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY stockDataProducer.py .
+
+ENTRYPOINT python stockDataProducer.py
+EOF
+
+REGHOST=`oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}'`
+
+podman build -f ./stockDockerfile -t stockproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman push $IMAGE $REGHOST/datalake/stockproducer:latest --tls-verify=false
+
+podman build -f ./weatherDockerfile -t weatherproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman push $IMAGE $REGHOST/datalake/weatherproducer:latest --tls-verify=false
+
+oc new-app weatherproducer
+oc new-app stockproducer
+
+wget https://ibm.box.com/shared/static/idkqhq3erg7ywaxmmjyh2zewsh9ympv9.txt -O weatherHistoryProducer.py
+wget https://ibm.box.com/shared/static/e6mw7p26soqsujqqac2923ab8x64xkww.txt -O stockHistoryProducer.py
+
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" stockHistoryProducer.py
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" weatherHistoryProducer.py
+
+REGHOST=`oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}'`
+
+cat > weatherHistoryDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY weatherHistoryProducer.py .
+
+ENTRYPOINT python weatherHistoryProducer.py
+EOF
+
+cat > stockHistoryDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY stockHistoryProducer.py .
+
+ENTRYPOINT python stockHistoryProducer.py
+EOF
+
+podman build -f ./stockHistoryDockerfile -t stockhistoryproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman push $IMAGE $REGHOST/datalake/stockhistoryproducer:latest --tls-verify=false
+
+podman build -f ./weatherHistoryDockerfile -t weatherhistoryproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman push $IMAGE $REGHOST/datalake/weatherhistoryproducer:latest --tls-verify=false
+
+oc new-app weatherhistoryproducer
+oc new-app stockhistoryproducer
+
+sleep 45
+
+oc delete deploy weatherhistoryproducer
+oc delete deploy stockhistoryproducer
+
+
+#######################################
+# Trino
+
+# Create trino namespace
+oc new-project trino --display-name="Trino" --description="Virtualizes access to datalakes via SQL."
+
+# Install Trino via Helm
+# See: https://github.com/trinodb/charts
+
+# Use this (instead of git clone) once a release > 0.8.0 is out:
+# helm repo add trino https://trinodb.github.io/charts/
+# wget https://raw.githubusercontent.com/trinodb/charts/main/charts/trino/values.yaml -O trino/values.yaml
+# ...
+# helm install trino trino/trino --version 0.8.0 -f trino/values.yaml --dry-run
+
+cd $GIT
+git clone https://github.com/trinodb/charts.git
+cd charts/charts
+
+# TODO: get rid of hard-coded secretes somehow?
+
+cat >> trino-catalogs.txt <<'EOF'
+additionalCatalogs:
+  kafka: |
+    connector.name=kafka
+    kafka.table-names=trinostock, trinoweather
+    kafka.nodes=stock-weather-streams-kafka-bootstrap.datalake:9092
+    kafka.hide-internal-columns=false
+    kafka.table-description-supplier=FILE
+    kafka.table-description-dir=/etc/trino/schemas
+    kafka.timestamp-upper-bound-force-push-down-enabled=true  
+  mongodb: |
+    connector.name=mongodb
+    mongodb.connection-url=mongodb://appuser2:apppwd2@mongodb.datalake:27017/?authSource=weather
+    mongodb.schema-collection=schemadef
+  postgresql: |
+    connector.name=postgresql
+    connection-url=jdbc:postgresql://postgresql.datalake:5432/stock-prices
+    connection-user=admin
+    connection-password=admin
+    decimal-mapping=allow_overflow
+    decimal-rounding-mode=HALF_UP
+EOF
+sed -i "/additionalCatalogs: {}/r trino-catalogs.txt" trino/values.yaml
+sed -i "/additionalCatalogs: {}/d" trino/values.yaml
+rm -f trino-catalogs.txt
+
+cat >> trino-kafka-table.txt <<'EOF'
+  tableDescriptions:
+    stockdata.json: |-
+      {
+        "tableName": "trinostock",
+        "topicName": "stockdata",
+        "dataFormat": "json",
+        "message": {
+          "dataFormat": "json",
+          "fields": [
+            {
+                "name": "date",
+                "mapping": "date",
+                "type": "DATE",
+                "dataFormat": "iso8601"
+            },
+            {
+                "name": "apple_price",
+                "mapping": "apple_price",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "volume",
+                "mapping": "volume",
+                "type": "BIGINT"
+            },
+            {
+                "name": "low",
+                "mapping": "low",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "high",
+                "mapping": "high",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "open",
+                "mapping": "open",
+                "type": "DOUBLE"
+            }
+          ]
+        }
+      }
+    weatherdata.json: |-
+      {
+        "tableName": "trinoweather",
+        "topicName": "weatherdata",
+        "dataFormat": "json",
+        "message": {
+          "dataFormat": "json",
+          "fields": [
+            {
+                "name": "STATION",
+                "mapping": "STATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "AWND",
+                "mapping": "AWND",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "PRCP",
+                "mapping": "PRCP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SNOW",
+                "mapping": "SNOW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SNWD",
+                "mapping": "SNWD",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TAVG",
+                "mapping": "TAVG",
+                "type": "DOUBLE"
+            },{
+                "name": "TMIN",
+                "mapping": "TMIN",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TMAX",
+                "mapping": "TMAX",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "DATE",
+                "mapping": "DATE",
+                "type": "DATE",
+                "dataFormat": "iso8601"
+            }
+          ]
+        }
+      }
+EOF
+sed -i "/  tableDescriptions: {}/r trino-kafka-table.txt" trino/values.yaml
+sed -i "/  tableDescriptions: {}/d" trino/values.yaml
+rm -f trino-kafka-table.txt
+
+cat >> trino-security-context.txt <<'EOF'
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+EOF
+sed -i "/serviceAccountName: {{ include \"trino.serviceAccountName\" . }}/r trino-security-context.txt" trino/templates/deployment-worker.yaml
+
+# Validate:
+# helm install trino ./trino --dry-run
+
+# Install:
+helm install trino ./trino 
+
+oc adm policy add-scc-to-user anyuid -z default -n trino
+
+# Test
+#TRINO_COORDINATOR_POD=$(oc get po -l component=coordinator -o jsonpath="{.items[0].metadata.name}")
+#oc rsh $TRINO_COORDINATOR_POD
+
+#/bin/bash
+#java -Dorg.jline.terminal.jna=false -jar /usr/bin/trino
+
+#SHOW CATALOGS;
+
+#USE postgresql.public;
+#SHOW TABLES;
+
+#USE mongodb.weather;
+#SHOW TABLES;
+
+# Uninstall
+# helm uninstall my-trino
+
+
+
+
+
+
+

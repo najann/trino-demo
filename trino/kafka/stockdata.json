@@ -1,0 +1,41 @@
+{
+    "tableName": "trinostock",
+    "topicName": "stockdata",
+    "dataFormat": "json",
+    "message": {
+        "dataFormat": "json",
+        "fields": [
+            {
+                "name": "date",
+                "mapping": "date",
+                "type": "DATE",
+                "dataFormat": "iso8601"
+            },
+            {
+                "name": "apple_price",
+                "mapping": "apple_price",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "volume",
+                "mapping": "volume",
+                "type": "BIGINT"
+            },
+            {
+                "name": "low",
+                "mapping": "low",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "high",
+                "mapping": "high",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "open",
+                "mapping": "open",
+                "type": "DOUBLE"
+            }
+        ]
+    }
+}

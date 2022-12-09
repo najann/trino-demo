@@ -1,0 +1,55 @@
+{
+    "tableName": "trinoweather",
+    "topicName": "weatherdata",
+    "dataFormat": "json",
+    "message": {
+        "dataFormat": "json",
+        "fields": [
+            {
+                "name": "STATION",
+                "mapping": "STATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "AWND",
+                "mapping": "AWND",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "PRCP",
+                "mapping": "PRCP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SNOW",
+                "mapping": "SNOW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SNWD",
+                "mapping": "SNWD",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TAVG",
+                "mapping": "TAVG",
+                "type": "DOUBLE"
+            },{
+                "name": "TMIN",
+                "mapping": "TMIN",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TMAX",
+                "mapping": "TMAX",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "DATE",
+                "mapping": "DATE",
+                "type": "DATE",
+                "dataFormat": "iso8601"
+            }
+        ]
+    }
+}

@@ -1,0 +1,776 @@
+# PostgreSQL Installation
+kubectl create namespace datalake
+kubectl config set-context --current --namespace=datalake
+
+export DATABASE_SERVICE_NAME=postgresql
+export POSTGRESQL_DATABASE=stock-prices
+export POSTGRESQL_PASSWORD=admin
+export POSTGRESQL_USER=admin
+
+## TODO: enter your credentials
+kubectl create secret docker-registry redhat-registry --docker-email={} --docker-username={} --docker-password={} --docker-server=registry.redhat.io
+
+cat > k8s_postgre_template.yaml <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${DATABASE_SERVICE_NAME}
+  labels: 
+    name: ${DATABASE_SERVICE_NAME}
+stringData:
+  database-name: ${POSTGRESQL_DATABASE}
+  database-password: ${POSTGRESQL_PASSWORD}
+  database-user: ${POSTGRESQL_USER}
+  database-db: ${POSTGRESQL_USER}
+---
+kind: PersistentVolume
+apiVersion: v1
+metadata:
+  name: ${DATABASE_SERVICE_NAME}-pv-volume
+  labels:
+    type: local
+    name: ${DATABASE_SERVICE_NAME}
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/mnt/data"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${DATABASE_SERVICE_NAME}
+  labels: 
+    name: ${DATABASE_SERVICE_NAME}
+spec:
+  storageClassName: manual
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${DATABASE_SERVICE_NAME}
+  labels: 
+    name: ${DATABASE_SERVICE_NAME}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: ${DATABASE_SERVICE_NAME}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        name: ${DATABASE_SERVICE_NAME}
+    spec:
+      containers:
+      - env:
+        - name: POSTGRES_USER #POSTGRESQL_USER
+          valueFrom:
+            secretKeyRef:
+              key: database-user
+              name: ${DATABASE_SERVICE_NAME}
+        - name: POSTGRES_PASSWORD #POSTGRESQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: database-password
+              name: ${DATABASE_SERVICE_NAME}
+        - name: POSTGRES_DB #POSTGRESQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              key: database-name
+              name: ${DATABASE_SERVICE_NAME}
+        # for docker image only
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        # registry.redhat.io/rhscl/postgresql-12-rhel7
+        image: registry.hub.docker.com/ppc64le/postgres # https://hub.docker.com/r/ppc64le/postgres
+        imagePullPolicy: IfNotPresent
+        name: ${DATABASE_SERVICE_NAME}
+        ports:
+          - containerPort: 5432
+            protocol: TCP
+        securityContext:
+          privileged: false
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data #/var/lib/psql/data
+          name: ${DATABASE_SERVICE_NAME}-data
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      imagePullSecrets:
+        - name: redhat-registry
+      volumes:
+      - name: ${DATABASE_SERVICE_NAME}-data
+        persistentVolumeClaim:
+          claimName: ${DATABASE_SERVICE_NAME}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+  name: ${DATABASE_SERVICE_NAME}
+  labels: 
+    name: ${DATABASE_SERVICE_NAME}
+spec:
+  ports:
+  - port: 5432
+    protocol: TCP
+    targetPort: 5432
+  selector:
+    name: ${DATABASE_SERVICE_NAME}
+  sessionAffinity: None
+  type: ClusterIP
+EOF
+envsubst < k8s_postgre_template.yaml | kubectl apply -f -
+# yum remove pgdg-redhat-repo.noarch for >> Error: Failed to download metadata for repo 'pgdg-common': Cannot download repomd.xml: Cannot download repodata/repomd.xml: All mirrors were tried
+# add --releasever=8 (or whatever major version you have) if you encounter:
+# ```
+# Errors during downloading metadata for repository 'pgdg-common':
+#   - Status code: 404 for https://download.postgresql.org/pub/repos/yum/common/redhat/rhel-8.5-ppc64le/repodata/repomd.xml (IP: 147.75.85.69)
+# Error: Failed to download metadata for repo 'pgdg-common': Cannot download repomd.xml: Cannot download repodata/repomd.xml: All mirrors were tried
+# ```
+
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-ppc64le/pgdg-redhat-repo-latest.noarch.rpm --releasever=8
+sudo dnf -qy module disable postgresql --releasever=8
+sudo dnf install -y postgresql10 --releasever=8
+
+POSTGRES_POD=$(kubectl get pod -l name=${DATABASE_SERVICE_NAME} -o jsonpath="{.items[0].metadata.name}")
+kubectl port-forward ${POSTGRES_POD} 5432:5432
+
+DATA_FILE=HistoricalData_Apple.csv
+wget https://ibm.box.com/shared/static/89i7cxkeok6ndd0kh6q2ycvviip94eby.csv -O $DATA_FILE
+sed -i 's/\$//g' $DATA_FILE
+cat > init-stock-prices.sql <<EOF
+CREATE TABLE IF NOT EXISTS public.applehistory
+(
+    "Date" date NOT NULL,
+    "Close" real,
+    "Volume" bigint,
+    "Open" real,
+    "High" real,
+    "Low" real,
+    CONSTRAINT "appleHistory_pkey" PRIMARY KEY ("Date")
+);
+
+\copy public.applehistory FROM '$DATA_FILE' WITH (FORMAT csv, HEADER true, DELIMITER ',');
+EOF
+psql -h 127.0.0.1 -p 5432 -U admin -d stock-prices -a -f init-stock-prices.sql
+
+#######################################
+# MongoDB
+
+cat > deploy-mongodb.yaml <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb
+  labels:
+    app: mongodb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: ibmcom/mongodb-ppc64le:latest
+        ports:
+        - containerPort: 27017
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          value: admin
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          value: admin
+        volumeMounts:
+        - mountPath: /data/db
+          name: mongodb-volume
+      volumes:
+      - name: mongodb-volume
+        persistentVolumeClaim:
+          claimName: mongodb-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongodb-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: mongodb
+  name: mongodb
+spec:
+  ports:
+  - port: 27017
+    protocol: TCP
+    targetPort: 27017
+  selector:
+    app: mongodb
+EOF
+
+oc apply -f deploy-mongodb.yaml
+
+# Fill MongoDB with data
+WEATHER_FILE=weather_ny_2012-2022.csv
+wget https://ibm.box.com/shared/static/3tgm9bwxsl8tjezk0jgfjvk48cma46li.csv -O $WEATHER_FILE
+
+# See: https://www.mongodb.com/try/download/shell?jmp=docs
+dnf install -y https://downloads.mongodb.com/compass/mongodb-mongosh-1.6.0.ppc64le.rpm --releasever=8
+
+# See: https://www.mongodb.com/try/download/database-tools?tck=docs_databasetools
+MONGODB_DATABASE_TOOLS=mongodb-database-tools-rhel81-ppc64le-100.6.0
+wget https://fastdl.mongodb.org/tools/db/${MONGODB_DATABASE_TOOLS}.tgz
+tar -xf ${MONGODB_DATABASE_TOOLS}.tgz
+mv ./${MONGODB_DATABASE_TOOLS}/bin/* /usr/bin/
+rm -f ${MONGODB_DATABASE_TOOLS}.tgz
+rm -rf ./${MONGODB_DATABASE_TOOLS}
+
+mongoimport -d weather -c weatherny --type csv --columnsHaveTypes --file $WEATHER_FILE --headerline --username admin --password admin --authenticationDatabase admin
+
+# db.weatherny.drop()
+
+MONGODB_POD=$(oc get po -l app=mongodb -o jsonpath="{.items[0].metadata.name}")
+kubectl port-forward ${MONGODB_POD} 27017:27017
+
+cat > mongo-schema-definition.json <<EOF
+{
+    "table": "weatherny",
+    "fields": [
+        {"name": "_id",
+         "type": "date",
+         "hidden": false },
+        {"name": "AWND",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "PGTM",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "PRCP",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "SNOW",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "SNWD",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "TAVG",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "TMAX",
+         "type": "DOUBLE",
+         "hidden": false },
+        {"name": "TMIN",
+         "type": "DOUBLE",
+         "hidden": false }
+    ]
+}
+EOF
+
+mongoimport -d weather -c schemadef --file mongo-schema-definition.json --username admin --password admin --authenticationDatabase admin
+# Maybe needed to connect to weather database (by Trino?)
+# because each database has to have a dedicated user (?)
+cat > create-mongo-user.mongodb <<EOF
+db.createUser(
+  {
+    user: "appuser2",
+    pwd: "apppwd2",
+    roles: [ { role: "dbOwner", db: "weather" } ]
+  }
+)
+EOF
+mongosh -u admin -p admin --authenticationDatabase admin weather -f create-mongo-user.mongodb
+# Test
+# mongosh -u appuser2 -p apppwd2 weather
+# db.weatherny.count()
+
+
+#################
+# Kafka Installation
+# https://access.redhat.com/documentation/en-us/red_hat_amq/7.3/html/using_amq_streams_on_openshift_container_platform/getting-started-str
+# https://access.redhat.com/jbossnetwork/restricted/listSoftware.html?downloadType=distributions&product=jboss.amq.streams
+# https://access.redhat.com/jbossnetwork/restricted/softwareDetail.html?softwareId=104743&product=jboss.amq.streams&version=2.2.0&downloadType=distributions
+
+wget https://ibm.box.com/shared/static/6ccbwncple6sngpiq3b890n8xqfq00c2.zip
+unzip 6ccbwncple6sngpiq3b890n8xqfq00c2.zip
+mkdir amq-streams-installer
+mv examples amq-streams-installer
+mv install amq-streams-installer
+sed -i 's/namespace: .*/namespace: datalake/' amq-streams-installer/install/cluster-operator/*RoleBinding*.yaml
+oc apply -f amq-streams-installer/install/cluster-operator
+
+cat > kafka_cluster.yaml <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-deployment
+  labels:
+    name: kafka-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: kafka-deployment
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        name: kafka-deployment
+    spec:
+      containers:
+      - image: registry.redhat.io/amq7/amq-streams-kafka-32-rhel8:2.2.0-9
+        imagePullPolicy: Always
+        name: amq-kafka
+      restartPolicy: Always
+      imagePullSecrets:
+        - name: redhat-registry
+EOF
+
+oc apply -f kafka_cluster.yaml
+
+cat > kafka_cluster.yaml <<EOF
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+ name: stock-weather-streams
+spec:
+  kafka:
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      inter.broker.protocol.version: '3.1'
+    storage:
+      type: ephemeral
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+    version: 3.1.0
+    replicas: 3
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+  zookeeper:
+    storage:
+      type: ephemeral
+    replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: stockdata
+  labels:
+    strimzi.io/cluster: stock-weather-streams
+spec:
+  partitions: 10
+  replicas: 3
+  config:
+    retention.ms: 604800000
+    segment.bytes: 1073741824
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: weatherdata
+  labels:
+    strimzi.io/cluster: stock-weather-streams
+spec:
+  partitions: 10
+  replicas: 3
+  config:
+    retention.ms: 604800000
+    segment.bytes: 1073741824
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaBridge
+metadata:
+  name: kafka-bridge
+  labels:
+    strimzi.io/cluster: stock-weather-streams
+spec:
+  replicas: 1
+  bootstrapServers: 'stock-weather-streams-kafka-bootstrap:9092'
+  http:
+    port: 8090
+EOF
+
+oc apply -f kafka_cluster.yaml
+
+### TODO -find an automatable solution
+# add imagePullSecrets: - name: redhat-registry above volumes in spec
+kubectl edit deployment.apps/strimzi-cluster-operator
+kubectl edit deployment.apps/kafka-bridge-bridge
+kubectl edit deployment.apps/stock-weather-streams-entity-operator
+
+kubectl patch serviceaccount default -p '{"imagePullSecrets": [{"name": "redhat-registry"}]}'
+kubectl patch serviceaccount stock-weather-streams-zookeeper -p '{"imagePullSecrets": [{"name": "redhat-registry"}]}'
+kubectl patch serviceaccount strimzi-cluster-operator -p '{"imagePullSecrets": [{"name": "redhat-registry"}]}'
+
+
+###############
+# Create Kafka Producers
+
+wget https://ibm.box.com/shared/static/78r9s8o7bpd81o420valu5ucureef8v2.txt -O stockDataProducer.py
+wget https://ibm.box.com/shared/static/h9lfvd5e87v3124m4mfhzf2xzmu5e83d.txt -O weatherDataProducer.py
+
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" stockDataProducer.py
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" weatherDataProducer.py
+
+cat > weatherDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY weatherDataProducer.py .
+
+ENTRYPOINT python weatherDataProducer.py
+EOF
+
+cat > stockDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY stockDataProducer.py .
+
+ENTRYPOINT python stockDataProducer.py
+EOF
+
+# TODO: enter credentials
+podman login -u="" -p="" quay.io
+
+podman build -f ./stockDockerfile -t stockproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman tag $IMAGE quay.io/nataliejann/kafkaproducers:stockproducer
+podman push quay.io/nataliejann/kafkaproducers:stockproducer
+
+podman build -f ./weatherDockerfile -t weatherproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman tag $IMAGE quay.io/nataliejann/kafkaproducers:weatherproducer
+podman push quay.io/nataliejann/kafkaproducers:weatherproducer
+
+podman logout quay.io
+
+
+cat > cron-job-weather.yaml <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: weatherproducer
+spec:
+  successfulJobsHistoryLimit: 1
+  schedule: "45 0 * * *"       
+  startingDeadlineSeconds: 200  
+  jobTemplate:                  
+    spec:
+      template:
+        metadata:
+          name: weatherproducer
+          labels:               
+            parent: "cronjobweatherproducer"
+        spec:
+          containers:
+          - name: weatherproducer
+            image: quay.io/nataliejann/kafkaproducers:weatherproducer
+            imagePullPolicy: Always
+          restartPolicy: OnFailure
+EOF
+
+kubectl create -f cron-job-weather.yaml
+
+
+cat > cron-job-stock.yaml <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: stockproducer
+spec:
+  successfulJobsHistoryLimit: 1
+  schedule: "0 16 * * *"       
+  startingDeadlineSeconds: 200  
+  jobTemplate:                  
+    spec:
+      template:
+        metadata:
+          name: stockproducers
+          labels:               
+            parent: "cronjobstockproducer"
+        spec:
+          containers:
+          - name: stockproducer
+            image: quay.io/nataliejann/kafkaproducers:stockproducer
+            imagePullPolicy: Always
+          restartPolicy: OnFailure
+EOF
+
+kubectl create -f cron-job-stock.yaml
+
+wget https://ibm.box.com/shared/static/idkqhq3erg7ywaxmmjyh2zewsh9ympv9.txt -O weatherHistoryProducer.py
+wget https://ibm.box.com/shared/static/e6mw7p26soqsujqqac2923ab8x64xkww.txt -O stockHistoryProducer.py
+
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" stockHistoryProducer.py
+sed -i "s/localhost:9093/stock-weather-streams-kafka-bootstrap.datalake:9092/" weatherHistoryProducer.py
+
+cat > weatherHistoryDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY weatherHistoryProducer.py .
+
+ENTRYPOINT python weatherHistoryProducer.py
+EOF
+
+cat > stockHistoryDockerfile <<EOF
+FROM python
+
+RUN pip install requests kafka-python
+COPY stockHistoryProducer.py .
+
+ENTRYPOINT python stockHistoryProducer.py
+EOF
+
+
+podman build -f ./stockHistoryDockerfile -t stockhistoryproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman tag $IMAGE quay.io/nataliejann/kafkaproducers:stockhistoryproducer
+podman push $IMAGE quay.io/nataliejann/kafkaproducers:stockhistoryproducer
+
+podman build -f ./weatherHistoryDockerfile -t weatherhistoryproducer
+IMAGE=$(podman images --format "{{.ID}} {{.CreatedAt}}" | sort -rk 2 | awk 'NR==1{print $1}')
+podman tag $IMAGE quay.io/nataliejann/kafkaproducers:weatherhistoryproducer
+podman push $IMAGE quay.io/nataliejann/kafkaproducers:weatherhistoryproducer
+
+cat > historyProducers.yaml <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weather-history-producer
+  labels:
+    app: weather-history-producer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weather-history-producer
+  template:
+    metadata:
+      labels:
+        app: weather-history-producer
+    spec:
+      containers:
+      - name: weather-history-producer
+        image: quay.io/nataliejann/kafkaproducers:weatherhistoryproducer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-history-producer
+  labels:
+    app: stock-history-producer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stock-history-producer
+  template:
+    metadata:
+      labels:
+        app: stock-history-producer
+    spec:
+      containers:
+      - name: stock-history-producer
+        image: quay.io/nataliejann/kafkaproducers:stockhistoryproducer
+EOF
+
+kubectl apply -f historyProducers.yaml 
+sleep 45
+kubectl delete deploy stock-history-producer weather-history-producer
+
+#######################################
+# Trino
+
+# Create trino namespace
+kubectl create namespace trino 
+
+kubectl config set-context --current --namespace=trino
+
+cd $GIT
+git clone https://github.com/trinodb/charts.git
+cd charts/charts
+
+cat >> trino-catalogs.txt <<'EOF'
+additionalCatalogs:
+  kafka: |
+    connector.name=kafka
+    kafka.table-names=trinostock, trinoweather
+    kafka.nodes=stock-weather-streams-kafka-bootstrap.datalake:9092
+    kafka.hide-internal-columns=false
+    kafka.table-description-supplier=FILE
+    kafka.table-description-dir=/etc/trino/schemas
+    kafka.timestamp-upper-bound-force-push-down-enabled=true  
+  mongodb: |
+    connector.name=mongodb
+    mongodb.connection-url=mongodb://appuser2:apppwd2@mongodb.datalake:27017/?authSource=weather
+    mongodb.schema-collection=schemadef
+  postgresql: |
+    connector.name=postgresql
+    connection-url=jdbc:postgresql://postgresql.datalake:5432/stock-prices
+    connection-user=admin
+    connection-password=admin
+    decimal-mapping=allow_overflow
+    decimal-rounding-mode=HALF_UP
+EOF
+sed -i "/additionalCatalogs: {}/r trino-catalogs.txt" trino/values.yaml
+sed -i "/additionalCatalogs: {}/d" trino/values.yaml
+rm -f trino-catalogs.txt
+
+cat >> trino-kafka-table.txt <<'EOF'
+  tableDescriptions:
+    stockdata.json: |-
+      {
+        "tableName": "trinostock",
+        "topicName": "stockdata",
+        "dataFormat": "json",
+        "message": {
+          "dataFormat": "json",
+          "fields": [
+            {
+                "name": "date",
+                "mapping": "date",
+                "type": "DATE",
+                "dataFormat": "iso8601"
+            },
+            {
+                "name": "apple_price",
+                "mapping": "apple_price",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "volume",
+                "mapping": "volume",
+                "type": "BIGINT"
+            },
+            {
+                "name": "low",
+                "mapping": "low",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "high",
+                "mapping": "high",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "open",
+                "mapping": "open",
+                "type": "DOUBLE"
+            }
+          ]
+        }
+      }
+    weatherdata.json: |-
+      {
+        "tableName": "trinoweather",
+        "topicName": "weatherdata",
+        "dataFormat": "json",
+        "message": {
+          "dataFormat": "json",
+          "fields": [
+            {
+                "name": "STATION",
+                "mapping": "STATION",
+                "type": "VARCHAR"
+            },
+            {
+                "name": "AWND",
+                "mapping": "AWND",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "PRCP",
+                "mapping": "PRCP",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SNOW",
+                "mapping": "SNOW",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "SNWD",
+                "mapping": "SNWD",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TAVG",
+                "mapping": "TAVG",
+                "type": "DOUBLE"
+            },{
+                "name": "TMIN",
+                "mapping": "TMIN",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "TMAX",
+                "mapping": "TMAX",
+                "type": "DOUBLE"
+            },
+            {
+                "name": "DATE",
+                "mapping": "DATE",
+                "type": "DATE",
+                "dataFormat": "iso8601"
+            }
+          ]
+        }
+      }
+EOF
+sed -i "/  tableDescriptions: {}/r trino-kafka-table.txt" trino/values.yaml
+sed -i "/  tableDescriptions: {}/d" trino/values.yaml
+rm -f trino-kafka-table.txt
+helm install trino ./trino 
+#TRINO_COORDINATOR_POD=$(kubectl get po -l component=coordinator -o jsonpath="{.items[0].metadata.name}")
+#kubectl exec -it $TRINO_COORDINATOR_POD -n trino -- /bin/bash
+
+#java -Dorg.jline.terminal.jna=false -jar /usr/bin/trino
+
+#SHOW CATALOGS;
+
+#USE postgresql.public;
+#SHOW TABLES;
+#SELECT * FROM public.applehistory LIMIT 5;
+
+
+#USE mongodb.weather;
+#SHOW TABLES;
+#SELECT * FROM weatherny LIMIT 5;
+
+# Uninstall
+# helm uninstall trino
