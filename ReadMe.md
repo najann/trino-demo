@@ -1,6 +1,6 @@
 # Stock Price Prediction to demonstrate Trino capabilities
 
-This demo is intended to demonstrate the central Trino features by accessing data from PostgreSQL, MongoDB and Kafka.
+This demo is intended to show the central Trino features by accessing data from PostgreSQL, MongoDB and Kafka.
 It is not meant to produce serious stock price predictions (general disclaimer)!
 
 ## Running on Kubeflow
@@ -11,16 +11,16 @@ This is used multiple times throught the demo pipeline.
 
 ## Running locally
 
-To run the demo locally, you can use [the setup script](./setup.sh).
+To run the demo locally, you can use [the setup script](./local_demo_setup/setup.sh).
 It assumes you set the following aliases according to your environment:
-- `startpostgre`: starts a local PostgreSQL server on port 5432. To be able to properly connect to your database, consult [`trino_postgresql_local_connect.md`](./trino_postgresql_local_connect.md).
+- `startpostgre`: starts a local PostgreSQL server on port 5432. To be able to properly connect to your database, consult [`trino_postgresql_local_connect.md`](./local_demo_setup/trino_postgresql_local_connect.md).
 - `activatenv`: creates and/or activates a Python environment.
 
 Moreover, you need to update the catalog definitions in [`trino/catalog/*.properties`](./trino/catalog) beforehand.
-Then, the setup script will start your PostgreSQL server, a MongoDB container, a Kafka cluster (defined in [`docker-compose.yaml`](./docker-compose.yaml)) and the Trino server.
+Then, the setup script will start your PostgreSQL server, a MongoDB container, a Kafka cluster (defined in [`docker-compose.yaml`](./local_demo_setup/docker-compose.yaml)) and the Trino server.
 
-Use [`fillMongoDB.ibpynb`](./fillMongoDB.ibpynb), [`fill_postgresql.sql`](./fill_postgresql.sql) and the Python producer scripts (for stock prices & weather) to fill all databases with the needed data.
+Use [`fillMongoDB.ibpynb`](./local_demo_setup/fillMongoDB.ibpynb), [`fill_postgresql.sql`](./local_demo_setup/fill_postgresql.sql) and the Python producer scripts (for stock prices & weather) to fill all databases with the needed data.
 In some of the Python scripts, you will be prompted to provide your API-key for RapidAPI and stockdata.org.
-Once the data is loaded, you should be able to run [`localTrinoTest.ipnyb`](localTrinoTest.ipnyb).
+Once the data is loaded, you should be able to run [`localTrinoTest.ipnyb`](./local_demo_setup/localTrinoTest.ipnyb).
 
-The setup can be stopped with [`teardown.sh`](./teardown.sh).
+The setup can be stopped with [`teardown.sh`](./local_demo_setup/teardown.sh).
